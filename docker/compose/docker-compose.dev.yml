@@ -1,0 +1,53 @@
+services:
+  postgres:
+    image: postgres:16-alpine
+    container_name: facs-postgres
+    environment:
+      POSTGRES_DB: facs
+      POSTGRES_USER: facs
+      POSTGRES_PASSWORD: facs_password
+    #volumes:
+    #  - postgres_data:/var/lib/postgresql/data
+    ports:
+      - "5432:5432"
+    networks:
+      - facs_network
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U facs"]
+      interval: 5s
+      timeout: 3s
+      retries: 5
+    restart: unless-stopped
+
+  facs:
+    build:
+      context: ../..
+      dockerfile: docker/Dockerfile
+    container_name: facs-server
+    environment:
+      - FACS_LOG_LEVEL=DEBUG
+      - DATABASE_URL=postgresql+asyncpg://facs:facs_password@postgres:5432/facs
+      - PYTHONUNBUFFERED=1
+    volumes:
+      # HOT RELOAD (main dev feature)
+      - ../../:/app
+    ports:
+      - "8000:8000"
+      - "5678:5678"  # debugger
+    depends_on:
+      postgres:
+        condition: service_healthy
+    networks:
+      - facs_network
+    command: >
+      sh -c "
+        pip install -r requirements.txt &&
+        python -m debugpy --listen 0.0.0.0:5678 --wait-for-client -m your_app
+      "
+
+volumes:
+  postgres_data:
+
+networks:
+  facs_network:
+    driver: bridge

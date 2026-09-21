@@ -1,0 +1,85 @@
+[build-system]
+requires = ["setuptools>=68", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "facs"
+version = "0.1.0"
+description = "CWMP/TR-069 fast auto configuration server with interactive CLI"
+authors = [
+    {name = "RedSegment"}
+]
+
+dependencies = [
+    'aiohttp==3.14.3',
+    'cmd2==4.2.4',
+    'cmd2-ansi==1.0.1',
+    'python-dotenv==1.2.3',
+    'rich==15.0.0',
+    'SQLAlchemy>=2.0',
+    'asyncpg==0.31.0'
+]
+
+[project.optional-dependencies]
+dev = [
+    "ruff",
+    "mypy",
+    "pytest",
+    "bump-my-version",
+    "pre-commit"
+]
+
+[project.scripts]
+facs = "src:cli"
+facs-cli = "src.cli:main"
+
+[tool.setuptools]
+packages = ["src"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+
+[tool.ruff]
+line-length = 150
+target-version = "py312"
+
+[tool.ruff.lint]
+select = ["E", "F", "I", "B", "UP"]
+extend-select = [
+    "ASYNC",   # async issues
+    "SIM",     # simplifications
+]
+
+[tool.ruff.lint.per-file-ignores]
+"tests/*" = ["E501", "F841"]
+
+[tool.mypy]
+python_version = "3.12"
+ignore_missing_imports = true
+
+[tool.bumpversion]
+current_version = "0.1.0"
+commit = true
+tag = true
+tag_name = "v{new_version}"
+message = "Bump version: {current_version} → {new_version}"
+
+[[tool.bumpversion.files]]
+filename = "pyproject.toml"
+search = "version = \"{current_version}\""
+replace = "version = \"{new_version}\""
+
+[[tool.bumpversion.files]]
+filename = "docker/Dockerfile"
+search = "# FACS v{current_version}"
+replace = "# FACS v{new_version}"
+
+[[tool.bumpversion.files]]
+filename = "src/__init__.py"
+search = "__version__ = \"{current_version}\""
+replace = "__version__ = \"{new_version}\""
+
+[[tool.bumpversion.files]]
+filename = "README.md"
+search = "**Version:** {current_version}"
+replace = "**Version:** {new_version}"

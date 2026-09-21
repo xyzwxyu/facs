@@ -1,0 +1,55 @@
+services:
+  postgres:
+    image: postgres:16-alpine
+    container_name: facs-postgres
+    environment:
+      POSTGRES_DB: facs
+      POSTGRES_USER: facs
+      POSTGRES_PASSWORD: facs_password
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+      - ../database/init-db.sql:/docker-entrypoint-initdb.d/init.sql:ro
+    ports:
+      - "5432:5432"
+    networks:
+      - facs_network
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U facs"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+    restart: unless-stopped
+
+  facs:
+    build:
+      context: ../..
+      dockerfile: docker/Dockerfile
+    container_name: facs-server
+    ports:
+      - "8000:8000"
+    environment:
+      - FACS_IP=0.0.0.0
+      - FACS_PORT=8000
+      - FACS_LOG_LEVEL=INFO
+      - DATABASE_URL=postgresql+asyncpg://facs:facs_password@postgres:5432/facs
+    volumes: []
+    depends_on:
+      postgres:
+        condition: service_healthy
+    restart: unless-stopped
+    networks:
+      - facs_network
+    healthcheck:
+      test: ["CMD", "facs", "--help"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 10s
+
+volumes:
+  postgres_data:
+    driver: local
+
+networks:
+  facs_network:
+    driver: bridge

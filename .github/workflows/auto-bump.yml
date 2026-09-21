@@ -1,0 +1,89 @@
+name: Auto Bump Version
+
+on:
+  push:
+    branches:
+      - main
+    paths:
+      - "src/**"
+      - "pyproject.toml"
+      - "docker/**"
+      - ".github/**"
+  workflow_dispatch:
+    inputs:
+      bump_type:
+        description: "Version bump type"
+        required: true
+        default: "patch"
+        type: choice
+        options:
+          - patch
+          - minor
+          - major
+
+jobs:
+  bump-version:
+    runs-on: ubuntu-latest
+
+    permissions:
+      contents: write
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Set up Python 3.12
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+          cache: "pip"
+
+      - name: Configure git
+        run: |
+          git config --local user.email "github-actions[bot]@users.noreply.github.com"
+          git config --local user.name "github-actions[bot]"
+
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install bump-my-version
+
+      - name: Check if already tagged
+        id: check_tag
+        run: |
+          VERSION=$(grep "^version = " pyproject.toml | cut -d'"' -f2)
+          if git rev-parse "v$VERSION" >/dev/null 2>&1; then
+            echo "already_tagged=true" >> $GITHUB_OUTPUT
+          else
+            echo "already_tagged=false" >> $GITHUB_OUTPUT
+          fi
+
+      - name: Determine bump type
+        id: bump_type
+        if: steps.check_tag.outputs.already_tagged == 'false'
+        run: |
+          # Check commit message for bump hints
+          LAST_COMMIT=$(git log -1 --pretty=%B)
+          if echo "$LAST_COMMIT" | grep -i "BREAKING\|major"; then
+            echo "type=major" >> $GITHUB_OUTPUT
+          elif echo "$LAST_COMMIT" | grep -i "feature\|feat"; then
+            echo "type=minor" >> $GITHUB_OUTPUT
+          else
+            echo "type=patch" >> $GITHUB_OUTPUT
+          fi
+
+      - name: Bump version
+        if: steps.check_tag.outputs.already_tagged == 'false'
+        run: |
+          BUMP_TYPE="${{ steps.bump_type.outputs.type }}"
+          if [ -n "${{ github.event.inputs.bump_type }}" ]; then
+            BUMP_TYPE="${{ github.event.inputs.bump_type }}"
+          fi
+          bump-my-version bump "$BUMP_TYPE"
+
+      - name: Push changes
+        if: steps.check_tag.outputs.already_tagged == 'false'
+        run: |
+          git push --follow-tags origin main

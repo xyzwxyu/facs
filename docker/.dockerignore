@@ -1,0 +1,61 @@
+# Git and version control
+.git
+.gitignore
+.github
+
+# Python
+__pycache__
+*.py[cod]
+*$py.class
+*.so
+.Python
+env/
+venv/
+.venv
+pip-log.txt
+pip-delete-this-directory.txt
+.tox/
+.coverage
+.coverage.*
+.cache
+nosetests.xml
+coverage.xml
+*.cover
+*.egg-info/
+dist/
+build/
+
+# IDE
+.vscode
+.idea
+*.swp
+*.swo
+*~
+.DS_Store
+
+# Development
+.env
+.env.local
+.env.*.local
+*.log
+facs.db
+
+# Docker specific
+Dockerfile
+docker-compose*.yml
+.docker
+.dockerignore
+
+# CI/CD
+.gitlab-ci.yml
+.travis.yml
+azure-pipelines.yml
+
+# Documentation build artifacts
+docs/_build/
+site/
+
+# Temporary files
+*.tmp
+*.temp
+.pytest_cache
