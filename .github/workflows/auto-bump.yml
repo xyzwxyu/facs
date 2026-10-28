@@ -1,89 +1,78 @@
 name: Auto Bump Version
 
 on:
-  push:
-    branches:
-      - main
-    paths:
-      - "src/**"
-      - "pyproject.toml"
-      - "docker/**"
-      - ".github/**"
-  workflow_dispatch:
+  workflow_call:
     inputs:
       bump_type:
-        description: "Version bump type"
+        description: Version increment to apply
         required: true
-        default: "patch"
-        type: choice
-        options:
-          - patch
-          - minor
-          - major
+        type: string
+    outputs:
+      version:
+        description: Version produced by the bump
+        value: ${{ jobs.bump.outputs.version }}
+      commit:
+        description: Commit containing the version update
+        value: ${{ jobs.bump.outputs.commit }}
 
 jobs:
-  bump-version:
+  bump:
     runs-on: ubuntu-latest
-
+    timeout-minutes: 15
     permissions:
       contents: write
+    outputs:
+      version: ${{ steps.version.outputs.version }}
+      commit: ${{ steps.push.outputs.commit }}
 
     steps:
-      - name: Checkout code
+      - name: Validate release request
+        env:
+          TARGET_REF: ${{ github.ref }}
+          BUMP_TYPE: ${{ inputs.bump_type }}
+        run: |
+          if [ "$TARGET_REF" != "refs/heads/main" ]; then
+            echo "Version bumps must be requested from main" >&2
+            exit 1
+          fi
+          case "$BUMP_TYPE" in
+            patch|minor|major) ;;
+            *) echo "Unsupported bump type: $BUMP_TYPE" >&2; exit 1 ;;
+          esac
+
+      - name: Checkout main
         uses: actions/checkout@v4
         with:
+          ref: main
           fetch-depth: 0
 
       - name: Set up Python 3.12
         uses: actions/setup-python@v5
         with:
           python-version: "3.12"
-          cache: "pip"
+          cache: pip
 
       - name: Configure git
         run: |
           git config --local user.email "github-actions[bot]@users.noreply.github.com"
           git config --local user.name "github-actions[bot]"
 
-      - name: Install dependencies
-        run: |
-          python -m pip install --upgrade pip
-          pip install bump-my-version
-
-      - name: Check if already tagged
-        id: check_tag
-        run: |
-          VERSION=$(grep "^version = " pyproject.toml | cut -d'"' -f2)
-          if git rev-parse "v$VERSION" >/dev/null 2>&1; then
-            echo "already_tagged=true" >> $GITHUB_OUTPUT
-          else
-            echo "already_tagged=false" >> $GITHUB_OUTPUT
-          fi
-
-      - name: Determine bump type
-        id: bump_type
-        if: steps.check_tag.outputs.already_tagged == 'false'
-        run: |
-          # Check commit message for bump hints
-          LAST_COMMIT=$(git log -1 --pretty=%B)
-          if echo "$LAST_COMMIT" | grep -i "BREAKING\|major"; then
-            echo "type=major" >> $GITHUB_OUTPUT
-          elif echo "$LAST_COMMIT" | grep -i "feature\|feat"; then
-            echo "type=minor" >> $GITHUB_OUTPUT
-          else
-            echo "type=patch" >> $GITHUB_OUTPUT
-          fi
+      - name: Install bump tool
+        run: python -m pip install bump-my-version
 
       - name: Bump version
-        if: steps.check_tag.outputs.already_tagged == 'false'
-        run: |
-          BUMP_TYPE="${{ steps.bump_type.outputs.type }}"
-          if [ -n "${{ github.event.inputs.bump_type }}" ]; then
-            BUMP_TYPE="${{ github.event.inputs.bump_type }}"
-          fi
-          bump-my-version bump "$BUMP_TYPE"
+        env:
+          BUMP_TYPE: ${{ inputs.bump_type }}
+        run: bump-my-version bump "$BUMP_TYPE"
 
-      - name: Push changes
-        if: steps.check_tag.outputs.already_tagged == 'false'
+      - name: Read bumped version
+        id: version
         run: |
-          git push --follow-tags origin main
+          VERSION=$(python -c 'import tomllib; print(tomllib.load(open("pyproject.toml", "rb"))["project"]["version"])')
+          echo "version=$VERSION" >> "$GITHUB_OUTPUT"
+
+      - name: Push version commit and tag
+        id: push
+        run: |
+          git push --follow-tags origin HEAD:main
+          echo "commit=$(git rev-parse HEAD)" >> "$GITHUB_OUTPUT"
