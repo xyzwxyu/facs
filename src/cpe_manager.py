@@ -90,11 +90,7 @@ class CPEManager:
         await self.db.upsert_device_parameters(device_id, list(parameters))
 
     async def remove_cpe(self, cpe_or_device_id) -> bool:
-        identifier = (
-            cpe_or_device_id
-            if isinstance(cpe_or_device_id, str)
-            else getattr(cpe_or_device_id, "device_id", None)
-        )
+        identifier = cpe_or_device_id if isinstance(cpe_or_device_id, str) else getattr(cpe_or_device_id, "device_id", None)
         return bool(identifier and await self.db.delete_device(identifier))
 
     async def remove_all_cpe(self) -> int:

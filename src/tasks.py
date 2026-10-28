@@ -44,10 +44,7 @@ class Task:
         self.completed_at = completed_at
 
     def __repr__(self) -> str:
-        return (
-            f"<Task task_id={self.task_id!r} device_id={self.device_id!r} "
-            f"command_type={self.command_type!r} status={self.status!r}>"
-        )
+        return f"<Task task_id={self.task_id!r} device_id={self.device_id!r} command_type={self.command_type!r} status={self.status!r}>"
 
 
 class Tasks:

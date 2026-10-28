@@ -115,11 +115,7 @@ class SessionManager:
             return session
 
     def _remove_expired_locked(self, now: float) -> int:
-        expired_ids = [
-            session_id
-            for session_id, session in self.sessions.items()
-            if not session.lock.locked() and session.is_expired(now)
-        ]
+        expired_ids = [session_id for session_id, session in self.sessions.items() if not session.lock.locked() and session.is_expired(now)]
         for session_id in expired_ids:
             del self.sessions[session_id]
         self.total_sessions_expired += len(expired_ids)
