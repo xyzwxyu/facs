@@ -1,9 +1,6 @@
 name: Release
 
 on:
-  push:
-    tags:
-      - "v*"
   workflow_dispatch:
     inputs:
       bump_type:
@@ -15,59 +12,59 @@ on:
           - patch
           - minor
           - major
+concurrency:
+  group: release-${{ github.ref }}
+  cancel-in-progress: false
 
 jobs:
+  bump:
+    uses: ./.github/workflows/auto-bump.yml
+    with:
+      bump_type: ${{ inputs.bump_type }}
+    permissions:
+      contents: write
+
   release:
+    needs: bump
     runs-on: ubuntu-latest
+    timeout-minutes: 30
 
     permissions:
       contents: write
-      packages: write
 
     steps:
       - name: Checkout code
         uses: actions/checkout@v4
-
-      - name: Set up Python 3.12
-        uses: actions/setup-python@v5
         with:
-          python-version: "3.12"
-          cache: "pip"
-
-      - name: Configure git
-        run: |
-          git config --local user.email "action@github.com"
-          git config --local user.name "GitHub Action"
-
-      - name: Install dependencies
-        run: |
-          python -m pip install --upgrade pip
-          pip install -e .[dev]
-
-      - name: Bump version (on workflow_dispatch)
-        if: github.event_name == 'workflow_dispatch'
-        run: |
-          bump-my-version bump ${{ github.event.inputs.bump_type }}
-          git push --follow-tags
+          ref: ${{ needs.bump.outputs.commit || github.ref }}
+          fetch-depth: 0
 
       - name: Get version
         id: version
+        env:
+          BUMPED_VERSION: ${{ needs.bump.outputs.version }}
+          TAG_NAME: ${{ github.ref_name }}
         run: |
-          VERSION=$(grep "^version = " pyproject.toml | cut -d'"' -f2)
+          VERSION="${BUMPED_VERSION:-${TAG_NAME#v}}"
           echo "version=${VERSION}" >> $GITHUB_OUTPUT
 
       - name: Create release notes
         id: release_notes
+        env:
+          VERSION: ${{ steps.version.outputs.version }}
         run: |
-          VERSION=${{ steps.version.outputs.version }}
           if [ -f "docs/CHANGELOG.md" ]; then
             NOTES=$(sed -n "/## \[$VERSION\]/,/## \[/p" docs/CHANGELOG.md | head -n -1)
-          else
+          fi
+          if [ -z "${NOTES:-}" ]; then
             NOTES="Release $VERSION"
           fi
-          echo "notes<<EOF" >> $GITHUB_OUTPUT
-          echo "$NOTES" >> $GITHUB_OUTPUT
-          echo "EOF" >> $GITHUB_OUTPUT
+          DELIMITER="END_NOTES_${GITHUB_RUN_ID}_${GITHUB_RUN_ATTEMPT}"
+          {
+            echo "notes<<$DELIMITER"
+            echo "$NOTES"
+            echo "$DELIMITER"
+          } >> "$GITHUB_OUTPUT"
 
       - name: Create GitHub Release
         uses: softprops/action-gh-release@v1
@@ -79,7 +76,9 @@ jobs:
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
 
-      - name: Build and push Docker image
+      - name: Build Docker images
+        env:
+          VERSION: ${{ steps.version.outputs.version }}
         run: |
-          docker build -f docker/Dockerfile -t facs:${{ steps.version.outputs.version }} .
+          docker build -f docker/Dockerfile -t "facs:${VERSION}" .
           docker build -f docker/Dockerfile -t facs:latest .
