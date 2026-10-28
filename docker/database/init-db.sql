@@ -3,7 +3,7 @@
 CREATE TABLE IF NOT EXISTS devices (
     id SERIAL PRIMARY KEY,
     device_id VARCHAR(255) UNIQUE NOT NULL,
-    serial_number VARCHAR(128) UNIQUE NOT NULL,
+    serial_number VARCHAR(128) NOT NULL,
     manufacturer VARCHAR(128),
     oui VARCHAR(6) NOT NULL,
     product_class VARCHAR(128),
@@ -44,12 +44,12 @@ CREATE TABLE IF NOT EXISTS task_queue (
 CREATE TABLE IF NOT EXISTS files (
     id SERIAL PRIMARY KEY,
     filename VARCHAR(255) NOT NULL,
-    
+
     -- TR-069 spec maps file type to string(64)
-    file_type VARCHAR(64) NOT NULL, 
+    file_type VARCHAR(64) NOT NULL,
     content BYTEA NOT NULL,
     created_at TIMESTAMPTZ NOT NULL DEFAULT CURRENT_TIMESTAMP,
-    
+
     CONSTRAINT chk_tr069_file_type CHECK (file_type IN (
         '1 Firmware Upgrade Image',
         '2 Web Content',
@@ -63,4 +63,3 @@ CREATE INDEX IF NOT EXISTS idx_device_parameters_device_path ON device_parameter
 CREATE INDEX IF NOT EXISTS idx_task_queue_device_status_created ON task_queue(device_id, status, created_at);
 GRANT ALL PRIVILEGES ON ALL TABLES IN SCHEMA public TO facs;
 GRANT ALL PRIVILEGES ON ALL SEQUENCES IN SCHEMA public TO facs;
-

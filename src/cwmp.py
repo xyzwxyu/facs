@@ -11,8 +11,8 @@ import logging
 from collections.abc import Mapping
 from datetime import UTC, datetime
 
-from src.cpe_manager import CPE, CPEManager
 from src.config import DEFAULT_MAX_SOAP_BYTES
+from src.cpe_manager import CPE, CPEManager
 from src.event_bus import EventBus
 from src.session_manager import HttpSession
 from src.soap import SoapBuilder, SoapParser, SoapProtocolError
@@ -40,6 +40,8 @@ SUPPORTED_TASK_METHODS = frozenset(
         "FactoryReset",
     }
 )
+
+TASK_RESPONSE_METHODS = {method: f"{method}Response" for method in SUPPORTED_TASK_METHODS}
 
 
 def _parameter_value(parameters: list[dict[str, str]], *suffixes: str) -> str | None:
@@ -211,6 +213,10 @@ class CWMP:
         response_id = soap.parse_cwmp_id()
         if response_id and response_id != task_id:
             return self._fault(soap, 8003, response_id)
+
+        expected_method = TASK_RESPONSE_METHODS.get(session.pending_method or "")
+        if method != "Fault" and method != expected_method:
+            return self._fault(soap, 8003, response_id or task_id)
 
         failed = method == "Fault"
         await self.task_manager.complete_task(task_id, "failed" if failed else "completed")
