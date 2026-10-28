@@ -23,8 +23,9 @@ jobs:
 
       - name: Install dependencies
         run: |
-          python -m pip install --upgrade pip
-          pip install -e .[dev]
+          python -m venv .venv
+          .venv/bin/python -m pip install --upgrade pip
+          .venv/bin/pip install -e '.[dev]'
 
       - name: Type checking (mypy)
         run: make type
@@ -33,7 +34,7 @@ jobs:
         run: make lint
 
       - name: Format check (ruff format)
-        run: ruff format --check .
+        run: .venv/bin/ruff format --check .
 
       - name: Run tests (pytest)
         run: make test
