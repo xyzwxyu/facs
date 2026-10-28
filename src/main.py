@@ -137,10 +137,7 @@ def main(argv: list[str] | None = None) -> int:
             stop_signal.set()
             raise KeyboardInterrupt
 
-        previous_handlers = {
-            signum: signal.signal(signum, signal_stop)
-            for signum in (signal.SIGINT, signal.SIGTERM)
-        }
+        previous_handlers = {signum: signal.signal(signum, signal_stop) for signum in (signal.SIGINT, signal.SIGTERM)}
         try:
             try:
                 run_cli(sock_path=args.socket)

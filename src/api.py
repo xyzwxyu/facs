@@ -19,7 +19,7 @@ def _timestamp(value: Any) -> str | None:
         return None
     if hasattr(value, "isoformat"):
         return value.isoformat()
-    if isinstance(value, (int, float)):
+    if isinstance(value, int | float):
         return datetime.fromtimestamp(value, tz=UTC).isoformat()
     return str(value)
 
@@ -86,9 +86,7 @@ class ACSApi:
     async def list_devices(self, request: web.Request) -> web.Response:
         offset, limit = _page(request)
         devices = await self.cpe_manager.get_all_cpe(offset=offset, limit=limit)
-        return web.json_response(
-            {"devices": [self._device_to_dict(device) for device in devices], "offset": offset, "limit": limit}
-        )
+        return web.json_response({"devices": [self._device_to_dict(device) for device in devices], "offset": offset, "limit": limit})
 
     async def get_device(self, request: web.Request) -> web.Response:
         device_id = request.match_info["device_id"]
@@ -142,9 +140,7 @@ class ACSApi:
     def _validate_payload(method: str, payload: Any) -> Any:
         if method == "SetParameterValues":
             # Preserve the existing CLI's `setparam NAME VALUE [TYPE]` form.
-            if isinstance(payload, list) and 2 <= len(payload) <= 3 and all(
-                isinstance(value, str) for value in payload
-            ):
+            if isinstance(payload, list) and 2 <= len(payload) <= 3 and all(isinstance(value, str) for value in payload):
                 payload = [
                     {
                         "name": payload[0],
@@ -181,6 +177,4 @@ class ACSApi:
             raise web.HTTPNotFound(text="device not found")
         offset, limit = _page(request)
         tasks = await self.tasks.get_all_tasks(device_id, offset=offset, limit=limit)
-        return web.json_response(
-            {"tasks": [self._task_to_dict(task) for task in tasks], "offset": offset, "limit": limit}
-        )
+        return web.json_response({"tasks": [self._task_to_dict(task) for task in tasks], "offset": offset, "limit": limit})

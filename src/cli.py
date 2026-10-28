@@ -130,9 +130,7 @@ class ApiClient:
     async def _get_session(self) -> aiohttp.ClientSession:
         if self._session is None or self._session.closed:
             connector: aiohttp.BaseConnector = (
-                aiohttp.UnixConnector(path=self.sock_path)
-                if self.sock_path is not None
-                else aiohttp.TCPConnector(ssl=self.ssl_context or True)
+                aiohttp.UnixConnector(path=self.sock_path) if self.sock_path is not None else aiohttp.TCPConnector(ssl=self.ssl_context or True)
             )
             headers = {"Authorization": f"Bearer {self.token}"} if self.token else None
             self._session = aiohttp.ClientSession(

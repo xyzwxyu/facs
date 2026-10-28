@@ -78,11 +78,7 @@ class CWMPHandler:
             session.mark_activity()
             cwmp_response = await self.cwmp.handle_request(session, body)
 
-        response = (
-            web.Response(text=cwmp_response, content_type="text/xml", charset="utf-8")
-            if cwmp_response
-            else web.Response(status=204)
-        )
+        response = web.Response(text=cwmp_response, content_type="text/xml", charset="utf-8") if cwmp_response else web.Response(status=204)
         response.set_cookie(
             "session",
             session.session_id,
@@ -176,9 +172,7 @@ class CWMPHandler:
             async with proxy.request(method, f"http://localhost{path}", json=command.get("data")) as response:
                 body = await response.text()
                 result = json.loads(body) if "application/json" in response.headers.get("Content-Type", "") else body
-                await ws.send_json(
-                    {"type": "ws.reply", "id": command_id, "status": response.status, "data": result}
-                )
+                await ws.send_json({"type": "ws.reply", "id": command_id, "status": response.status, "data": result})
         except (ValueError, TypeError) as exc:
             await ws.send_json(
                 {
@@ -340,12 +334,7 @@ class CWMPServer:
 
     async def shutdown(self) -> None:
         async with self._shutdown_lock:
-            if (
-                not self._started
-                and self.app_runner is None
-                and self.cli_runner is None
-                and self.remote_management_runner is None
-            ):
+            if not self._started and self.app_runner is None and self.cli_runner is None and self.remote_management_runner is None:
                 return
             await self._cleanup_runners()
             await self.handler.shutdown()
