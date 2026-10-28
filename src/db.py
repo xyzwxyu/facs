@@ -43,7 +43,7 @@ class Device(Base):
 
     id: Mapped[int] = mapped_column(Integer, primary_key=True)
     device_id: Mapped[str] = mapped_column(String(255), unique=True, nullable=False, index=True)
-    serial_number: Mapped[str] = mapped_column(String(128), unique=True, nullable=False, index=True)
+    serial_number: Mapped[str] = mapped_column(String(128), nullable=False, index=True)
     manufacturer: Mapped[str | None] = mapped_column(String(128))
     oui: Mapped[str] = mapped_column(String(6), nullable=False)
     product_class: Mapped[str | None] = mapped_column(String(128))
@@ -157,16 +157,10 @@ class Database:
             return dict(result.mappings().one())
 
     async def get_device(self, cpe_or_device_id) -> Mapping[str, Any] | None:
-        identifier = (
-            cpe_or_device_id
-            if isinstance(cpe_or_device_id, str)
-            else getattr(cpe_or_device_id, "device_id", None)
-        )
+        identifier = cpe_or_device_id if isinstance(cpe_or_device_id, str) else getattr(cpe_or_device_id, "device_id", None)
         if not identifier:
             return None
-        statement = select(Device.__table__).where(
-            or_(Device.device_id == identifier, Device.serial_number == identifier)
-        ).limit(1)
+        statement = select(Device.__table__).where(or_(Device.device_id == identifier, Device.serial_number == identifier)).limit(1)
         async with self.SessionLocal() as session:
             return _mapping(await session.execute(statement))
 
@@ -230,9 +224,7 @@ class Database:
                 await session.execute(statement)
 
     async def delete_device(self, identifier: str) -> bool:
-        statement = delete(Device).where(
-            or_(Device.device_id == identifier, Device.serial_number == identifier)
-        ).returning(Device.id)
+        statement = delete(Device).where(or_(Device.device_id == identifier, Device.serial_number == identifier)).returning(Device.id)
         async with self.SessionLocal.begin() as session:
             result = await session.execute(statement)
             return result.scalar_one_or_none() is not None
@@ -337,12 +329,7 @@ class Database:
         values: dict[str, Any] = {"status": status}
         if status in {"completed", "failed"}:
             values["completed_at"] = utc_now()
-        statement = (
-            update(TaskQueue)
-            .where(TaskQueue.task_id == task_id)
-            .values(**values)
-            .returning(*TaskQueue.__table__.c)
-        )
+        statement = update(TaskQueue).where(TaskQueue.task_id == task_id).values(**values).returning(*TaskQueue.__table__.c)
         async with self.SessionLocal.begin() as session:
             return _mapping(await session.execute(statement))
 
