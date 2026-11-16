@@ -11,6 +11,7 @@ authors = [
 ]
 
 dependencies = [
+    "argcomplete>=3.5.2,<4",
     'aiohttp==3.14.3',
     'cmd2==4.2.4',
     'cmd2-ansi==1.0.1',

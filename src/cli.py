@@ -5,6 +5,8 @@ Notifications use the corresponding WebSocket endpoint. Neither mode needs
 an in-process reference to the ACS or its event bus.
 """
 
+# PYTHON_ARGCOMPLETE_OK
+
 from __future__ import annotations
 
 import argparse
@@ -22,7 +24,9 @@ from typing import Any
 from urllib.parse import quote, urlencode, urlsplit
 
 import aiohttp
+import argcomplete
 import cmd2
+from argcomplete.completers import FilesCompleter, SuppressCompleter
 from cmd2 import CommandSet, with_argparser, with_category
 from cmd2_ansi import Fg, ansi
 from rich.table import Table
@@ -30,6 +34,10 @@ from rich.table import Table
 from src.config import CliSettings, socket_path_from_env
 
 logger = logging.getLogger(__name__)
+
+
+def _set_completer(action: argparse.Action, completer: object) -> None:
+    action.completer = completer  # type: ignore[attr-defined]
 
 
 class AsyncRunner:
@@ -125,7 +133,7 @@ class ApiClient:
     @property
     def ws_url(self) -> str:
         scheme = "wss" if self.sock_path is None else "ws"
-        return f"{scheme}://{urlsplit(self.base_url).netloc}/manage/ws"
+        return f"{scheme}://{urlsplit(self.base_url).netloc}/cli/ws"
 
     async def _get_session(self) -> aiohttp.ClientSession:
         if self._session is None or self._session.closed:
@@ -160,7 +168,7 @@ class ApiClient:
     async def all_devices(self) -> list[dict[str, Any]]:
         devices: list[dict[str, Any]] = []
         while True:
-            response = await self.request("GET", f"/api/devices?offset={len(devices)}&limit=1000", timeout_seconds=60)
+            response = await self.request("GET", f"/cli/devices?offset={len(devices)}&limit=1000", timeout_seconds=60)
             page = response.get("devices", [])
             devices.extend(page)
             if len(page) < 1000:
@@ -172,6 +180,20 @@ class ApiClient:
         future = self.async_runner.run(self.all_devices())
         try:
             return future.result(timeout=60)
+        except TimeoutError:
+            future.cancel()
+            raise
+
+    async def provisioning_settings_catalog(self) -> dict[str, Any]:
+        response = await self.request("GET", "/cli/provisioning/settings")
+        return response.get("catalog", {})
+
+    def get_provisioning_settings_catalog(self) -> dict[str, Any]:
+        if self.async_runner is None:
+            raise RuntimeError("CLI event loop is not configured")
+        future = self.async_runner.run(self.provisioning_settings_catalog())
+        try:
+            return future.result(timeout=15)
         except TimeoutError:
             future.cancel()
             raise
@@ -283,11 +305,12 @@ class CPECommandSet(CommandSet):
         super().__init__()
         self.api_client = api_client
         self.device_id: str | None = None
+        self.parameter_choices: list[cmd2.CompletionItem] = []
 
     def _path(self, suffix: str = "") -> str:
         if self.device_id is None:
             raise RuntimeError("no CPE selected")
-        return f"/api/devices/{quote(self.device_id, safe='')}{suffix}"
+        return f"/cli/devices/{quote(self.device_id, safe='')}{suffix}"
 
     def _queue_task(self, method: str, payload: Any = None) -> bool:
         try:
@@ -306,7 +329,7 @@ class CPECommandSet(CommandSet):
         return True
 
     set_parser = cmd2.Cmd2ArgumentParser()
-    set_parser.add_argument("name", help="TR-069 parameter name")
+    set_parser.add_argument("name", help="TR-069 parameter name", choices_provider=lambda self: self.parameter_choices)
     set_parser.add_argument("value", help="new parameter value")
     set_parser.add_argument("value_type", nargs="?", default="xsd:string", help="XSD type (default: xsd:string)")
 
@@ -318,7 +341,7 @@ class CPECommandSet(CommandSet):
 
     get_parser = cmd2.Cmd2ArgumentParser()
     get_parser.add_argument("kind", choices=["names", "values"])
-    get_parser.add_argument("parameter", nargs="+", help="TR-069 path or parameter name")
+    get_parser.add_argument("parameter", nargs="+", help="TR-069 path or parameter name", choices_provider=lambda self: self.parameter_choices)
     get_parser.add_argument("--next-level", action="store_true", help="return only the next hierarchy level")
 
     @with_argparser(get_parser)
@@ -405,11 +428,18 @@ class FacsShell(cmd2.Cmd):
         self.selected_device_id: str | None = None
         self.cpe_choices: list[cmd2.CompletionItem] = []
         self.cpe_commands = CPECommandSet(self.api_client)
+        self.parameter_paths_by_device: dict[str, set[str]] = {}
+        self.parameter_choices: list[cmd2.CompletionItem] = []
+        self._parameter_cache_lock = threading.RLock()
+        self.provisioning_paths_global: set[str] = set()
+        self.provisioning_paths_by_cpe: dict[str, set[str]] = {}
+        self._provisioning_cache_lock = threading.RLock()
         self._cpe_commands_registered = False
         self._closed = False
 
         # Confirm API access and authentication before presenting a prompt.
         self.refresh_device_choices(required=True)
+        self.refresh_provisioning_catalog()
         self._events_future = self.async_runner.run(self._watch_events())
 
     def refresh_device_choices(self, *, required: bool = False) -> None:
@@ -422,6 +452,56 @@ class FacsShell(cmd2.Cmd):
             return
         device_ids = [device.get("device_id") for device in devices if device.get("device_id")]
         self.cpe_choices = [cmd2.CompletionItem(device_id) for device_id in device_ids]
+
+    def refresh_provisioning_catalog(self) -> None:
+        try:
+            catalog = self.api_client.get_provisioning_settings_catalog()
+        except Exception:
+            logger.warning("unable to refresh provisioning setting completions", exc_info=True)
+            return
+        with self._provisioning_cache_lock:
+            self.provisioning_paths_global = set(catalog.get("global", []))
+            self.provisioning_paths_by_cpe = {cpe_id: set(paths) for cpe_id, paths in catalog.get("by_cpe", {}).items()}
+
+    def _refresh_parameter_choices(self) -> None:
+        with self._parameter_cache_lock:
+            paths = sorted({path for device_paths in self.parameter_paths_by_device.values() for path in device_paths})
+            self.parameter_choices = [cmd2.CompletionItem(path) for path in paths]
+
+    def _record_parameter_paths(self, device_id: str, paths: list[str]) -> None:
+        with self._parameter_cache_lock:
+            self.parameter_paths_by_device.setdefault(device_id, set()).update(path for path in paths if path)
+            self._refresh_parameter_choices()
+            if getattr(self, "selected_device_id", None) == device_id:
+                self.cpe_commands.parameter_choices = self.parameter_choices_for(device_id)
+
+    def _remove_parameter_paths(self, device_id: str) -> None:
+        with self._parameter_cache_lock:
+            self.parameter_paths_by_device.pop(device_id, None)
+            self._refresh_parameter_choices()
+            if getattr(self, "selected_device_id", None) == device_id:
+                self.cpe_commands.parameter_choices = []
+
+    def parameter_choices_for(self, device_id: str | None = None) -> list[cmd2.CompletionItem]:
+        with self._parameter_cache_lock:
+            paths = self.parameter_paths_by_device.get(device_id, set()) if device_id else {item.value for item in self.parameter_choices}
+            return [cmd2.CompletionItem(path) for path in sorted(paths)]
+
+    def _provision_setting_choices(self, arg_tokens: dict[str, list[str]]) -> list[cmd2.CompletionItem]:
+        cpe_ids = arg_tokens.get("cpe_id", [])
+        with self._provisioning_cache_lock:
+            paths = self.provisioning_paths_by_cpe.get(cpe_ids[-1], set()) if cpe_ids else self.provisioning_paths_global
+            return [cmd2.CompletionItem(path) for path in sorted(paths)]
+
+    def _record_provisioning_setting(self, parameter_path: str, cpe_id: str | None) -> None:
+        with self._provisioning_cache_lock:
+            if cpe_id:
+                self.provisioning_paths_by_cpe.setdefault(cpe_id, set()).add(parameter_path)
+            else:
+                self.provisioning_paths_global.add(parameter_path)
+
+    def _device_choices_with_all(self) -> list[cmd2.CompletionItem]:
+        return [*self.cpe_choices, cmd2.CompletionItem("all")]
 
     async def _watch_events(self) -> None:
         delay = 1
@@ -436,8 +516,24 @@ class FacsShell(cmd2.Cmd):
                             self.cpe_choices = [*self.cpe_choices, cmd2.CompletionItem(device_id)]
                     elif event_type == "cpe.unprovisioned" and device_id:
                         self.cpe_choices = [item for item in self.cpe_choices if item.value != device_id]
+                        self._remove_parameter_paths(device_id)
+                        with self._provisioning_cache_lock:
+                            self.provisioning_paths_by_cpe.pop(device_id, None)
                     elif event_type == "cpe.unprovisioned_all":
                         self.cpe_choices = []
+                        with self._parameter_cache_lock:
+                            self.parameter_paths_by_device.clear()
+                            self._refresh_parameter_choices()
+                        with self._provisioning_cache_lock:
+                            self.provisioning_paths_by_cpe.clear()
+                    elif event_type == "cpe.parameters_updated" and device_id:
+                        paths = event.get("data", {}).get("paths", [])
+                        self._record_parameter_paths(device_id, paths)
+                    elif event_type == "provisioning.setting_updated":
+                        data = event.get("data", {})
+                        parameter_path = data.get("parameter_path")
+                        if parameter_path:
+                            self._record_provisioning_setting(parameter_path, data.get("cpe_id"))
                     if event_type.startswith(("cpe.", "task.")):
                         details = json.dumps(event.get("data", {}), sort_keys=True, default=str)
                         self.add_alert(
@@ -456,6 +552,7 @@ class FacsShell(cmd2.Cmd):
             self.unregister_command_set(self.cpe_commands)  # type: ignore[type-var]
         self.selected_device_id = device_id
         self.cpe_commands.device_id = device_id
+        self.cpe_commands.parameter_choices = self.parameter_choices_for(device_id)
         self.register_command_set(self.cpe_commands)  # type: ignore[type-var]
         self._cpe_commands_registered = True
         self.prompt = f"(facs:{device_id}) "
@@ -466,6 +563,7 @@ class FacsShell(cmd2.Cmd):
             self._cpe_commands_registered = False
         self.selected_device_id = None
         self.cpe_commands.device_id = None
+        self.cpe_commands.parameter_choices = []
         self.prompt = "(facs) "
 
     ping_parser = cmd2.Cmd2ArgumentParser()
@@ -490,13 +588,14 @@ class FacsShell(cmd2.Cmd):
     def do_use(self, args) -> None:
         """Select a CPE and enable device-specific commands."""
         try:
-            response = self.api_client.get(f"/api/devices/{quote(args.device_id, safe='')}")
+            response = self.api_client.get(f"/cli/devices/{quote(args.device_id, safe='')}")
         except Exception as exc:
             self.poutput(ansi.style(f"Cannot select CPE: {exc}", fg=Fg.RED))
             return
         if not response.get("device"):
             self.poutput(ansi.style("Device not found.", fg=Fg.RED))
             return
+        self._record_parameter_paths(args.device_id, response["device"].get("parameters", []))
         self._select_device(args.device_id)
 
     list_parser = cmd2.Cmd2ArgumentParser()
@@ -535,22 +634,30 @@ class FacsShell(cmd2.Cmd):
 
     show_actions = provision_actions.add_parser("show").add_subparsers(dest="show_action", required=True)
     show_settings_parser = show_actions.add_parser("settings")
-    show_settings_parser.add_argument("--cpe", dest="cpe_id", help="show settings scoped to this CPE")
+    show_settings_parser.add_argument("--cpe", dest="cpe_id", help="show settings scoped to this CPE", choices_provider=lambda self: self.cpe_choices)
 
     get_actions = provision_actions.add_parser("get").add_subparsers(dest="get_action", required=True)
     get_settings_parser = get_actions.add_parser("settings")
-    get_settings_parser.add_argument("parameter_path", help="full CWMP parameter path")
-    get_settings_parser.add_argument("--cpe", dest="cpe_id", help="read settings scoped to this CPE")
+    get_settings_parser.add_argument(
+        "parameter_path",
+        help="full CWMP parameter path",
+        choices_provider=lambda self, arg_tokens: self._provision_setting_choices(arg_tokens),
+    )
+    get_settings_parser.add_argument("--cpe", dest="cpe_id", help="read settings scoped to this CPE", choices_provider=lambda self: self.cpe_choices)
 
     set_actions = provision_actions.add_parser("set").add_subparsers(dest="set_action", required=True)
     set_settings_parser = set_actions.add_parser("settings")
-    set_settings_parser.add_argument("parameter_path", help="full CWMP parameter path")
-    set_settings_parser.add_argument("value", help="string value to provision")
+    set_settings_parser.add_argument(
+        "parameter_path",
+        help="full CWMP parameter path",
+        choices_provider=lambda self, arg_tokens: self._provision_setting_choices(arg_tokens),
+    )
+    set_settings_parser.add_argument("value", nargs="?", help="string value to provision")
     set_settings_parser.add_argument("value_type", nargs="?", default="xsd:string", help="XSD value type (default: xsd:string)")
-    set_settings_parser.add_argument("--cpe", dest="cpe_id", help="stage this setting for a CPE")
+    set_settings_parser.add_argument("--cpe", dest="cpe_id", help="stage this setting for a CPE", choices_provider=lambda self: self.cpe_choices)
 
     remove_parser = provision_actions.add_parser("remove")
-    remove_parser.add_argument("target", help="device ID or 'all'")
+    remove_parser.add_argument("target", help="device ID or 'all'", choices_provider=lambda self: self._device_choices_with_all())
     remove_parser.add_argument("--yes", action="store_true", help="confirm deleting all devices")
 
     @with_argparser(provision_parser)
@@ -564,6 +671,9 @@ class FacsShell(cmd2.Cmd):
             self._get_provisioning_setting(args.parameter_path, args.cpe_id)
             return
         if args.provision_action == "set":
+            if args.value is None:
+                self.poutput("A value is required. Usage: provision set settings PARAMETER_PATH VALUE [VALUE_TYPE] [--cpe CPE_ID]")
+                return
             self._set_provisioning_setting(args.parameter_path, args.value, args.value_type, args.cpe_id)
             return
         self._remove_provisioning_target(args.target, args.yes)
@@ -575,7 +685,7 @@ class FacsShell(cmd2.Cmd):
     def _show_provisioning_settings(self, cpe_id: str | None) -> None:
         title = f"Provisioning settings ({cpe_id})" if cpe_id else "Global provisioning settings"
         try:
-            response = self.api_client.get(f"/api/provisioning/settings{self._provisioning_scope_query(cpe_id)}")
+            response = self.api_client.get(f"/cli/provisioning/settings{self._provisioning_scope_query(cpe_id)}")
         except Exception as exc:
             self.poutput(ansi.style(f"Failed to query provisioning settings: {exc}", fg=Fg.RED))
             return
@@ -589,7 +699,7 @@ class FacsShell(cmd2.Cmd):
         self.poutput(table if settings else "No provisioning settings in this scope.")
 
     def _get_provisioning_setting(self, parameter_path: str, cpe_id: str | None) -> None:
-        path = f"/api/provisioning/settings/{quote(parameter_path, safe='')}"
+        path = f"/cli/provisioning/settings/{quote(parameter_path, safe='')}"
         try:
             response = self.api_client.get(f"{path}{self._provisioning_scope_query(cpe_id)}")
         except Exception as exc:
@@ -599,13 +709,14 @@ class FacsShell(cmd2.Cmd):
         self.poutput(f"{setting.get('parameter_path', parameter_path)} = {setting.get('value', '')} ({setting.get('value_type', 'xsd:string')})")
 
     def _set_provisioning_setting(self, parameter_path: str, value: str, value_type: str, cpe_id: str | None) -> None:
-        path = f"/api/provisioning/settings/{quote(parameter_path, safe='')}"
+        path = f"/cli/provisioning/settings/{quote(parameter_path, safe='')}"
         payload = {"value": value, "value_type": value_type}
         try:
             self.api_client.put(f"{path}{self._provisioning_scope_query(cpe_id)}", payload)
         except Exception as exc:
             self.poutput(ansi.style(f"Failed to set provisioning setting: {exc}", fg=Fg.RED))
             return
+        self._record_provisioning_setting(parameter_path, cpe_id)
         scope = f" for CPE {cpe_id}" if cpe_id else " globally"
         self.poutput(ansi.style(f"Saved {parameter_path}{scope}.", fg=Fg.GREEN))
 
@@ -615,11 +726,11 @@ class FacsShell(cmd2.Cmd):
                 if not yes:
                     self.poutput(ansi.style("Deleting all devices requires: provision remove all --yes", fg=Fg.LIGHT_YELLOW))
                     return
-                response = self.api_client.delete("/api/devices", timeout_seconds=120)
+                response = self.api_client.delete("/cli/devices", timeout_seconds=120)
                 self._clear_device()
                 self.poutput(f"Deleted {response.get('deleted_count', 0)} devices.")
             else:
-                self.api_client.delete(f"/api/devices/{quote(target, safe='')}")
+                self.api_client.delete(f"/cli/devices/{quote(target, safe='')}")
                 if self.selected_device_id == target:
                     self._clear_device()
                 self.poutput(f"Deleted device {target}.")
@@ -664,10 +775,10 @@ class FacsShell(cmd2.Cmd):
 def cli_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description="Connect to a running FACS ACS")
     connection = parser.add_mutually_exclusive_group()
-    connection.add_argument("--socket", default=None, help="local Unix socket (default: FACS_SOCKET_PATH)")
-    connection.add_argument("--url", help="remote HTTPS management origin, e.g. https://acs.example:8443")
-    parser.add_argument("--token", help="remote bearer token (defaults to FACS_ADMIN_TOKEN)")
-    parser.add_argument("--ca-file", help="PEM CA certificate for a private TLS authority")
+    _set_completer(connection.add_argument("--socket", default=None, help="local Unix socket (default: FACS_SOCKET_PATH)"), FilesCompleter())
+    _set_completer(connection.add_argument("--url", help="remote HTTPS management origin, e.g. https://acs.example:8443"), SuppressCompleter())
+    _set_completer(parser.add_argument("--token", help="remote bearer token (defaults to FACS_ADMIN_TOKEN)"), SuppressCompleter())
+    _set_completer(parser.add_argument("--ca-file", help="PEM CA certificate for a private TLS authority"), FilesCompleter())
     return parser
 
 
@@ -709,7 +820,9 @@ def run_cli(
 
 def main(argv: list[str] | None = None) -> int:
     settings = CliSettings.from_env()
-    args = cli_parser().parse_args(argv)
+    parser = cli_parser()
+    argcomplete.autocomplete(parser, default_completer=SuppressCompleter())
+    args = parser.parse_args(argv)
     url = args.url or (settings.url if args.socket is None else None)
     sock_path = args.socket if args.socket is not None else (None if url else settings.socket_path)
     token = args.token or (settings.token if url else None)

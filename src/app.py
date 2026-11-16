@@ -161,7 +161,7 @@ class CWMPHandler:
                 or parsed_path is None
                 or parsed_path.scheme
                 or parsed_path.netloc
-                or not parsed_path.path.startswith("/api/")
+                or not parsed_path.path.startswith("/cli/")
                 or parsed_path.fragment
                 or len(path) > 2048
                 or method not in {"GET", "POST", "DELETE"}
@@ -252,11 +252,14 @@ class CWMPServer:
         if admin_token:
             app[MANAGEMENT_SOCKET_KEY] = self.sock_path
         app.router.add_get("/manage/ws", self.handler.websocket_handler)
-        ACSApi(
+        app.router.add_get("/cli/ws", self.handler.websocket_handler)
+        api = ACSApi(
             cpe_manager=self.cpe_manager,
             tasks=self.task_manager,
             event_bus=self.event_bus,
-        ).setup_routes(app)
+        )
+        api.setup_routes(app, prefix="/api")
+        api.setup_routes(app, prefix="/cli")
         return app
 
     async def health(self, request: web.Request) -> web.Response:

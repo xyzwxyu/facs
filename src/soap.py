@@ -253,6 +253,23 @@ class SoapParser(SoapBuilder):
             )
         return parameters
 
+    def parse_parameter_names(self) -> list[dict[str, str]]:
+        if self.root is None:
+            return []
+        parameters: list[dict[str, str]] = []
+        for struct in (item for item in self.root.iter() if _local_name(item.tag) == "ParameterInfoStruct"):
+            name = self._find_first("Name", struct)
+            writable = self._find_first("Writable", struct)
+            if name is None or not name.text:
+                continue
+            parameters.append(
+                {
+                    "Name": name.text.strip(),
+                    "Writable": writable.text.strip() if writable is not None and writable.text else "true",
+                }
+            )
+        return parameters
+
     def parse_manufacturer(self) -> str | None:
         return self._text("Manufacturer")
 

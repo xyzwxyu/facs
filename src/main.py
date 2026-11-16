@@ -1,5 +1,7 @@
 """Standalone FACS ACS, with an optional detachable CLI."""
 
+# PYTHON_ARGCOMPLETE_OK
+
 from __future__ import annotations
 
 import argparse
@@ -10,6 +12,9 @@ import signal
 import ssl
 import threading
 from concurrent.futures import Future
+
+import argcomplete
+from argcomplete.completers import ChoicesCompleter, FilesCompleter, SuppressCompleter
 
 from src.app import CWMPServer
 from src.cli import run_cli
@@ -24,23 +29,30 @@ from src.tasks import Tasks
 logger = logging.getLogger("FACS")
 
 
+def _set_completer(action: argparse.Action, completer: object) -> None:
+    action.completer = completer  # type: ignore[attr-defined]
+
+
 def build_parser() -> argparse.ArgumentParser:
     settings = ServerSettings.from_env()
     parser = argparse.ArgumentParser(description="FACS CWMP/TR-069 ACS")
     parser.add_argument("-i", "--ip", default=settings.ip)
     parser.add_argument("-p", "--port", default=settings.port, type=int)
-    parser.add_argument("--socket", default=settings.socket_path)
+    _set_completer(parser.add_argument("--socket", default=settings.socket_path), FilesCompleter())
     parser.add_argument("--max-sessions", default=settings.max_sessions, type=int)
     parser.add_argument("--max-soap-bytes", default=settings.max_soap_bytes, type=int)
     parser.add_argument("--database-url", default=settings.database_url)
-    parser.add_argument("--log-level", default=settings.log_level)
-    parser.add_argument("--log-file", default=settings.log_file)
+    _set_completer(
+        parser.add_argument("--log-level", default=settings.log_level),
+        ChoicesCompleter({level: level for level in ("CRITICAL", "ERROR", "WARNING", "INFO", "DEBUG")}),
+    )
+    _set_completer(parser.add_argument("--log-file", default=settings.log_file), FilesCompleter())
     parser.add_argument("-cli", "--cli", action="store_true", help="attach a detachable CLI to this ACS process")
     parser.add_argument("--manage-ip", default=settings.manage_ip)
     parser.add_argument("--manage-port", default=settings.manage_port, type=int)
-    parser.add_argument("--tls-cert", default=settings.tls_cert)
-    parser.add_argument("--tls-key", default=settings.tls_key)
-    parser.add_argument("--admin-token", default=settings.admin_token)
+    _set_completer(parser.add_argument("--tls-cert", default=settings.tls_cert), FilesCompleter())
+    _set_completer(parser.add_argument("--tls-key", default=settings.tls_key), FilesCompleter())
+    _set_completer(parser.add_argument("--admin-token", default=settings.admin_token), SuppressCompleter())
     return parser
 
 
@@ -106,7 +118,9 @@ async def serve(args, *, started: Future[None] | None = None, stop_signal: threa
 
 
 def main(argv: list[str] | None = None) -> int:
-    args = build_parser().parse_args(argv)
+    parser = build_parser()
+    argcomplete.autocomplete(parser, default_completer=SuppressCompleter())
+    args = parser.parse_args(argv)
     configure_logging(args.log_level, log_file=args.log_file)
     if args.cli:
         # cmd2 owns stdin and signals on the main thread. The ACS runs on a

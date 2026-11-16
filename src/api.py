@@ -62,16 +62,17 @@ class ACSApi:
         self.tasks = tasks
         self.event_bus = event_bus
 
-    def setup_routes(self, app: web.Application) -> None:
-        app.router.add_get("/api/devices", self.list_devices)
-        app.router.add_get("/api/devices/{device_id}", self.get_device)
-        app.router.add_delete("/api/devices", self.delete_all_devices)
-        app.router.add_delete("/api/devices/{device_id}", self.delete_device)
-        app.router.add_post("/api/devices/{device_id}/rpc", self.create_rpc_task)
-        app.router.add_get("/api/devices/{device_id}/tasks", self.get_device_tasks)
-        app.router.add_get("/api/provisioning/settings", self.list_provisioning_settings)
-        app.router.add_get("/api/provisioning/settings/{parameter_path}", self.get_provisioning_setting)
-        app.router.add_put("/api/provisioning/settings/{parameter_path}", self.set_provisioning_setting)
+    def setup_routes(self, app: web.Application, *, prefix: str = "/api") -> None:
+        prefix = prefix.rstrip("/")
+        app.router.add_get(f"{prefix}/devices", self.list_devices)
+        app.router.add_get(f"{prefix}/devices/{{device_id}}", self.get_device)
+        app.router.add_delete(f"{prefix}/devices", self.delete_all_devices)
+        app.router.add_delete(f"{prefix}/devices/{{device_id}}", self.delete_device)
+        app.router.add_post(f"{prefix}/devices/{{device_id}}/rpc", self.create_rpc_task)
+        app.router.add_get(f"{prefix}/devices/{{device_id}}/tasks", self.get_device_tasks)
+        app.router.add_get(f"{prefix}/provisioning/settings", self.list_provisioning_settings)
+        app.router.add_get(f"{prefix}/provisioning/settings/{{parameter_path}}", self.get_provisioning_setting)
+        app.router.add_put(f"{prefix}/provisioning/settings/{{parameter_path}}", self.set_provisioning_setting)
 
     @staticmethod
     def _device_to_dict(device) -> dict[str, Any]:
@@ -117,7 +118,10 @@ class ACSApi:
         device = await self.cpe_manager.get_cpe(device_id)
         if not device:
             raise web.HTTPNotFound(text="device not found")
-        return web.json_response({"device": self._device_to_dict(device)})
+        device_data = self._device_to_dict(device)
+        parameters = await self.cpe_manager.get_device_parameter_paths(device_id)
+        device_data["parameters"] = sorted({parameter["path"] for parameter in parameters})
+        return web.json_response({"device": device_data})
 
     async def delete_device(self, request: web.Request) -> web.Response:
         device_id = request.match_info["device_id"]
@@ -149,7 +153,13 @@ class ACSApi:
 
     async def list_provisioning_settings(self, request: web.Request) -> web.Response:
         settings = await self.cpe_manager.get_provisioning_settings(self._provisioning_scope(request))
-        return web.json_response({"settings": [self._setting_to_dict(setting) for setting in settings]})
+        catalog = await self.cpe_manager.get_provisioning_settings_catalog()
+        return web.json_response(
+            {
+                "settings": [self._setting_to_dict(setting) for setting in settings],
+                "catalog": catalog,
+            }
+        )
 
     async def get_provisioning_setting(self, request: web.Request) -> web.Response:
         parameter_path = request.match_info["parameter_path"]
@@ -182,6 +192,10 @@ class ACSApi:
             value,
             value_type,
             self._provisioning_scope(request),
+        )
+        await self.event_bus.publish(
+            "provisioning.setting_updated",
+            {"cpe_id": setting.get("cpe_id"), "parameter_path": parameter_path},
         )
         return web.json_response({"status": "saved", "setting": self._setting_to_dict(setting)}, status=200)
 
