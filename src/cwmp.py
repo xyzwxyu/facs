@@ -138,6 +138,9 @@ class CWMP:
         session.cwmp_namespace = soap.cwmp_namespace
 
         await self.cpe_manager.update_parameters(saved.device_id, parameters)
+        paths = sorted({parameter["Name"] for parameter in parameters if parameter.get("Name")})
+        if paths:
+            await self.event_bus.publish("cpe.parameters_updated", {"device_id": saved.device_id, "paths": paths})
         events = soap.parse_events()
         await self.event_bus.publish(
             "cpe.inform",
@@ -236,10 +239,19 @@ class CWMP:
         if not failed and method == "GetParameterValuesResponse" and session.device_id:
             parameters = soap.parse_parameters()
             await self.cpe_manager.update_parameters(session.device_id, parameters)
+            paths = sorted({parameter["Name"] for parameter in parameters if parameter.get("Name")})
+            if paths:
+                await self.event_bus.publish("cpe.parameters_updated", {"device_id": session.device_id, "paths": paths})
             if is_provisioning_discovery:
                 supported_paths = {parameter.get("Name") for parameter in parameters}
                 heartbeat_supported = HEARTBEAT_PARAMETER_PATHS.issubset(supported_paths)
                 await self._queue_provisioning_settings(session.device_id, heartbeat_supported)
+        elif not failed and method == "GetParameterNamesResponse" and session.device_id:
+            parameters = soap.parse_parameter_names()
+            await self.cpe_manager.update_parameter_paths(session.device_id, parameters)
+            paths = sorted({parameter["Name"] for parameter in parameters if parameter.get("Name")})
+            if paths:
+                await self.event_bus.publish("cpe.parameters_updated", {"device_id": session.device_id, "paths": paths})
         elif failed and is_provisioning_discovery and session.device_id:
             await self._queue_provisioning_settings(session.device_id, heartbeat_supported=False)
 

@@ -89,9 +89,19 @@ class CPEManager:
     async def update_parameters(self, device_id: str, parameters: Sequence[Mapping[str, str]]) -> None:
         await self.db.upsert_device_parameters(device_id, list(parameters))
 
+    async def update_parameter_paths(self, device_id: str, parameters: Sequence[Mapping[str, str]]) -> None:
+        await self.db.upsert_device_parameter_paths(device_id, list(parameters))
+
+    async def get_device_parameter_paths(self, device_id: str | None = None) -> list[dict[str, str]]:
+        rows = await self.db.get_device_parameter_paths(device_id)
+        return [dict(row) for row in rows]
+
     async def get_provisioning_settings(self, cpe_id: str | None = None) -> list[dict[str, Any]]:
         rows = await self.db.get_provisioning_settings(cpe_id)
         return [dict(row) for row in rows]
+
+    async def get_provisioning_settings_catalog(self) -> dict[str, Any]:
+        return await self.db.get_provisioning_settings_catalog()
 
     async def get_provisioning_setting(self, parameter_path: str, cpe_id: str | None = None) -> dict[str, Any] | None:
         row = await self.db.get_provisioning_setting(parameter_path, cpe_id)

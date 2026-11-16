@@ -277,12 +277,64 @@ class Database:
                 )
                 await session.execute(statement)
 
+    async def upsert_device_parameter_paths(self, device_id: str, parameters: list[Mapping[str, str]]) -> None:
+        timestamp = utc_now()
+        values = [
+            {
+                "device_id": device_id,
+                "path": parameter["Name"],
+                "value": None,
+                "value_type": "xsd:string",
+                "writable": str(parameter.get("Writable", "true")).lower() in {"1", "true"},
+                "updated_at": timestamp,
+            }
+            for parameter in parameters
+            if parameter.get("Name")
+        ]
+        if not values:
+            return
+        async with self.SessionLocal.begin() as session:
+            for start in range(0, len(values), PARAMETER_UPSERT_BATCH_SIZE):
+                statement = pg_insert(DeviceParameter).values(values[start : start + PARAMETER_UPSERT_BATCH_SIZE])
+                statement = statement.on_conflict_do_update(
+                    index_elements=[DeviceParameter.device_id, DeviceParameter.path],
+                    set_={"writable": statement.excluded.writable, "updated_at": statement.excluded.updated_at},
+                )
+                await session.execute(statement)
+
+    async def get_device_parameter_paths(self, device_id: str | None = None) -> Sequence[Mapping[str, str]]:
+        statement = select(DeviceParameter.device_id, DeviceParameter.path).order_by(DeviceParameter.device_id, DeviceParameter.path)
+        if device_id is not None:
+            statement = statement.where(DeviceParameter.device_id == device_id)
+        async with self.SessionLocal() as session:
+            result = await session.execute(statement)
+            return [{"device_id": row.device_id, "path": row.path} for row in result.all()]
+
     async def get_provisioning_settings(self, cpe_id: str | None = None) -> Sequence[Mapping[str, Any]]:
         scope_filter = ProvisioningSetting.cpe_id.is_(None) if cpe_id is None else ProvisioningSetting.cpe_id == cpe_id
         statement = select(ProvisioningSetting.__table__).where(scope_filter).order_by(ProvisioningSetting.parameter_path)
         async with self.SessionLocal() as session:
             result = await session.execute(statement)
             return [dict(row) for row in result.mappings().all()]
+
+    async def get_provisioning_settings_catalog(self) -> dict[str, Any]:
+        statement = select(ProvisioningSetting.cpe_id, ProvisioningSetting.parameter_path).order_by(
+            ProvisioningSetting.cpe_id,
+            ProvisioningSetting.parameter_path,
+        )
+        async with self.SessionLocal() as session:
+            result = await session.execute(statement)
+            global_paths: set[str] = set()
+            paths_by_cpe: dict[str, set[str]] = {}
+            for cpe_id, parameter_path in result.all():
+                if cpe_id is None:
+                    global_paths.add(parameter_path)
+                else:
+                    paths_by_cpe.setdefault(cpe_id, set()).add(parameter_path)
+            return {
+                "global": sorted(global_paths),
+                "by_cpe": {cpe_id: sorted(paths) for cpe_id, paths in sorted(paths_by_cpe.items())},
+            }
 
     async def get_provisioning_setting(self, parameter_path: str, cpe_id: str | None = None) -> Mapping[str, Any] | None:
         scope_filter = ProvisioningSetting.cpe_id.is_(None) if cpe_id is None else ProvisioningSetting.cpe_id == cpe_id
