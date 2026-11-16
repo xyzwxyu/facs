@@ -4,11 +4,12 @@ from __future__ import annotations
 
 from collections.abc import Mapping, Sequence
 from datetime import UTC, datetime, timedelta
-from typing import Any
+from typing import Any, cast
 
 from sqlalchemy import (
     JSON,
     Boolean,
+    CheckConstraint,
     DateTime,
     ForeignKey,
     Index,
@@ -19,15 +20,23 @@ from sqlalchemy import (
     delete,
     or_,
     select,
+    text,
     update,
 )
 from sqlalchemy.dialects.postgresql import insert as pg_insert
+from sqlalchemy.engine import CursorResult
 from sqlalchemy.ext.asyncio import AsyncEngine, async_sessionmaker, create_async_engine
 from sqlalchemy.orm import DeclarativeBase, Mapped, mapped_column
 
 from src.config import DatabaseSettings, require_asyncpg_url
 
 PARAMETER_UPSERT_BATCH_SIZE = 1_000
+DEFAULT_PROVISIONING_SETTINGS = (
+    ("Device.ManagementServer.PeriodicInformEnable", "true", "xsd:boolean"),
+    ("Device.ManagementServer.PeriodicInformInterval", "86400", "xsd:unsignedInt"),
+    ("Device.ManagementServer.HeartbeatPolicy.Enable", "true", "xsd:boolean"),
+    ("Device.ManagementServer.HeartbeatPolicy.ReportingInterval", "30", "xsd:unsignedInt"),
+)
 
 
 def utc_now() -> datetime:
@@ -73,6 +82,34 @@ class DeviceParameter(Base):
     value: Mapped[str | None] = mapped_column(Text)
     value_type: Mapped[str] = mapped_column(String(64), default="xsd:string")
     writable: Mapped[bool] = mapped_column(Boolean, default=True)
+    updated_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utc_now, onupdate=utc_now)
+
+
+class ProvisioningSetting(Base):
+    __tablename__ = "provisioning_settings"
+    __table_args__ = (
+        CheckConstraint("length(parameter_path) > 0", name="ck_provisioning_setting_path_nonempty"),
+        CheckConstraint("length(value_type) > 0", name="ck_provisioning_setting_type_nonempty"),
+        Index(
+            "uq_provisioning_setting_global_path",
+            "parameter_path",
+            unique=True,
+            postgresql_where=text("cpe_id IS NULL"),
+        ),
+        Index(
+            "uq_provisioning_setting_cpe_path",
+            "cpe_id",
+            "parameter_path",
+            unique=True,
+            postgresql_where=text("cpe_id IS NOT NULL"),
+        ),
+    )
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True)
+    cpe_id: Mapped[str | None] = mapped_column(String(255))
+    parameter_path: Mapped[str] = mapped_column(String(1024), nullable=False)
+    value: Mapped[str] = mapped_column(Text, nullable=False)
+    value_type: Mapped[str] = mapped_column(String(64), nullable=False, default="xsd:string")
     updated_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utc_now, onupdate=utc_now)
 
 
@@ -132,6 +169,23 @@ class Database:
     async def init_db(self) -> None:
         async with self.engine.begin() as connection:
             await connection.run_sync(Base.metadata.create_all)
+        async with self.SessionLocal.begin() as session:
+            insert_statement = pg_insert(ProvisioningSetting).values(
+                [
+                    {
+                        "cpe_id": None,
+                        "parameter_path": parameter_path,
+                        "value": value,
+                        "value_type": value_type,
+                    }
+                    for parameter_path, value, value_type in DEFAULT_PROVISIONING_SETTINGS
+                ]
+            )
+            statement = insert_statement.on_conflict_do_nothing(
+                index_elements=[ProvisioningSetting.parameter_path],
+                index_where=ProvisioningSetting.cpe_id.is_(None),
+            )
+            await session.execute(statement)
 
     async def add_device(self, cpe) -> Mapping[str, Any]:
         values = {
@@ -223,16 +277,71 @@ class Database:
                 )
                 await session.execute(statement)
 
-    async def delete_device(self, identifier: str) -> bool:
-        statement = delete(Device).where(or_(Device.device_id == identifier, Device.serial_number == identifier)).returning(Device.id)
+    async def get_provisioning_settings(self, cpe_id: str | None = None) -> Sequence[Mapping[str, Any]]:
+        scope_filter = ProvisioningSetting.cpe_id.is_(None) if cpe_id is None else ProvisioningSetting.cpe_id == cpe_id
+        statement = select(ProvisioningSetting.__table__).where(scope_filter).order_by(ProvisioningSetting.parameter_path)
+        async with self.SessionLocal() as session:
+            result = await session.execute(statement)
+            return [dict(row) for row in result.mappings().all()]
+
+    async def get_provisioning_setting(self, parameter_path: str, cpe_id: str | None = None) -> Mapping[str, Any] | None:
+        scope_filter = ProvisioningSetting.cpe_id.is_(None) if cpe_id is None else ProvisioningSetting.cpe_id == cpe_id
+        statement = select(ProvisioningSetting.__table__).where(
+            ProvisioningSetting.parameter_path == parameter_path,
+            scope_filter,
+        )
+        async with self.SessionLocal() as session:
+            return _mapping(await session.execute(statement))
+
+    async def set_provisioning_setting(
+        self,
+        parameter_path: str,
+        value: str,
+        value_type: str,
+        cpe_id: str | None = None,
+    ) -> Mapping[str, Any]:
+        insert_statement = pg_insert(ProvisioningSetting).values(
+            cpe_id=cpe_id,
+            parameter_path=parameter_path,
+            value=value,
+            value_type=value_type,
+            updated_at=utc_now(),
+        )
+        conflict_columns: list[Any]
+        if cpe_id is None:
+            conflict_columns = [ProvisioningSetting.parameter_path]
+            conflict_scope = ProvisioningSetting.cpe_id.is_(None)
+        else:
+            conflict_columns = [ProvisioningSetting.cpe_id, ProvisioningSetting.parameter_path]
+            conflict_scope = ProvisioningSetting.cpe_id.is_not(None)
+        statement = insert_statement.on_conflict_do_update(
+            index_elements=conflict_columns,
+            index_where=conflict_scope,
+            set_={
+                "value": insert_statement.excluded.value,
+                "value_type": insert_statement.excluded.value_type,
+                "updated_at": insert_statement.excluded.updated_at,
+            },
+        ).returning(*ProvisioningSetting.__table__.c)
         async with self.SessionLocal.begin() as session:
             result = await session.execute(statement)
-            return result.scalar_one_or_none() is not None
+            return dict(result.mappings().one())
+
+    async def delete_device(self, identifier: str) -> bool:
+        statement = delete(Device).where(or_(Device.device_id == identifier, Device.serial_number == identifier)).returning(Device.device_id)
+        async with self.SessionLocal.begin() as session:
+            result = await session.execute(statement)
+            device_id = result.scalar_one_or_none()
+            if device_id is None:
+                return False
+            await session.execute(delete(ProvisioningSetting).where(ProvisioningSetting.cpe_id == device_id))
+            return True
 
     async def delete_all_devices(self) -> int:
         async with self.SessionLocal.begin() as session:
-            result = await session.execute(delete(Device).returning(Device.id))
-            return len(result.scalars().all())
+            await session.execute(delete(ProvisioningSetting).where(ProvisioningSetting.cpe_id.is_not(None)))
+            result = cast(CursorResult[Any], await session.execute(delete(Device)))
+            return result.rowcount or 0
 
     async def add_task(self, task) -> Mapping[str, Any]:
         statement = (

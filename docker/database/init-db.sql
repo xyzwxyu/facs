@@ -26,6 +26,20 @@ CREATE TABLE IF NOT EXISTS device_parameters (
     CONSTRAINT uq_device_parameter_path UNIQUE (device_id, path)
 );
 
+CREATE TABLE IF NOT EXISTS provisioning_settings (
+    id SERIAL PRIMARY KEY,
+    cpe_id VARCHAR(255),
+    parameter_path VARCHAR(1024) NOT NULL CHECK (length(parameter_path) > 0),
+    value TEXT NOT NULL,
+    value_type VARCHAR(64) NOT NULL DEFAULT 'xsd:string' CHECK (length(value_type) > 0),
+    updated_at TIMESTAMPTZ NOT NULL DEFAULT CURRENT_TIMESTAMP
+);
+
+CREATE UNIQUE INDEX IF NOT EXISTS uq_provisioning_setting_global_path
+    ON provisioning_settings(parameter_path) WHERE cpe_id IS NULL;
+CREATE UNIQUE INDEX IF NOT EXISTS uq_provisioning_setting_cpe_path
+    ON provisioning_settings(cpe_id, parameter_path) WHERE cpe_id IS NOT NULL;
+
 CREATE TABLE IF NOT EXISTS task_queue (
     id SERIAL PRIMARY KEY,
     task_id VARCHAR(64) UNIQUE NOT NULL,

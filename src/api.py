@@ -12,6 +12,27 @@ from src.cwmp import SUPPORTED_TASK_METHODS
 from src.tasks import Task
 
 MAX_PAGE_SIZE = 1000
+XSD_TYPES = frozenset(
+    {
+        "xsd:string",
+        "xsd:boolean",
+        "xsd:byte",
+        "xsd:unsignedByte",
+        "xsd:short",
+        "xsd:unsignedShort",
+        "xsd:int",
+        "xsd:unsignedInt",
+        "xsd:long",
+        "xsd:unsignedLong",
+        "xsd:integer",
+        "xsd:decimal",
+        "xsd:float",
+        "xsd:double",
+        "xsd:dateTime",
+        "xsd:base64Binary",
+        "xsd:hexBinary",
+    }
+)
 
 
 def _timestamp(value: Any) -> str | None:
@@ -48,6 +69,9 @@ class ACSApi:
         app.router.add_delete("/api/devices/{device_id}", self.delete_device)
         app.router.add_post("/api/devices/{device_id}/rpc", self.create_rpc_task)
         app.router.add_get("/api/devices/{device_id}/tasks", self.get_device_tasks)
+        app.router.add_get("/api/provisioning/settings", self.list_provisioning_settings)
+        app.router.add_get("/api/provisioning/settings/{parameter_path}", self.get_provisioning_setting)
+        app.router.add_put("/api/provisioning/settings/{parameter_path}", self.set_provisioning_setting)
 
     @staticmethod
     def _device_to_dict(device) -> dict[str, Any]:
@@ -106,6 +130,60 @@ class ACSApi:
         deleted_count = await self.cpe_manager.remove_all_cpe()
         await self.event_bus.publish("cpe.unprovisioned_all", {"deleted_count": deleted_count})
         return web.json_response({"status": "deleted_all", "deleted_count": deleted_count})
+
+    @staticmethod
+    def _provisioning_scope(request: web.Request) -> str | None:
+        cpe_id = request.query.get("cpe_id")
+        if cpe_id is not None and not cpe_id.strip():
+            raise web.HTTPBadRequest(text="cpe_id must not be empty")
+        return cpe_id
+
+    @staticmethod
+    def _setting_to_dict(setting: Mapping[str, Any]) -> dict[str, Any]:
+        return {
+            "cpe_id": setting.get("cpe_id"),
+            "parameter_path": setting.get("parameter_path"),
+            "value": setting.get("value"),
+            "value_type": setting.get("value_type", "xsd:string"),
+        }
+
+    async def list_provisioning_settings(self, request: web.Request) -> web.Response:
+        settings = await self.cpe_manager.get_provisioning_settings(self._provisioning_scope(request))
+        return web.json_response({"settings": [self._setting_to_dict(setting) for setting in settings]})
+
+    async def get_provisioning_setting(self, request: web.Request) -> web.Response:
+        parameter_path = request.match_info["parameter_path"]
+        if not parameter_path.strip():
+            raise web.HTTPBadRequest(text="parameter_path must not be empty")
+        setting = await self.cpe_manager.get_provisioning_setting(parameter_path, self._provisioning_scope(request))
+        if setting is None:
+            raise web.HTTPNotFound(text="provisioning setting not found")
+        return web.json_response({"setting": self._setting_to_dict(setting)})
+
+    async def set_provisioning_setting(self, request: web.Request) -> web.Response:
+        parameter_path = request.match_info["parameter_path"]
+        if not parameter_path.strip():
+            raise web.HTTPBadRequest(text="parameter_path must not be empty")
+        try:
+            data = await request.json()
+        except (ValueError, TypeError) as exc:
+            raise web.HTTPBadRequest(text="request body must be valid JSON") from exc
+        if not isinstance(data, Mapping):
+            raise web.HTTPBadRequest(text="request body must be a JSON object")
+        value = data.get("value")
+        value_type = data.get("value_type", "xsd:string")
+        if not isinstance(value, str):
+            raise web.HTTPBadRequest(text="value must be a string")
+        if not isinstance(value_type, str) or value_type not in XSD_TYPES:
+            allowed = ", ".join(sorted(XSD_TYPES))
+            raise web.HTTPBadRequest(text=f"value_type must be a supported XSD type; allowed: {allowed}")
+        setting = await self.cpe_manager.set_provisioning_setting(
+            parameter_path,
+            value,
+            value_type,
+            self._provisioning_scope(request),
+        )
+        return web.json_response({"status": "saved", "setting": self._setting_to_dict(setting)}, status=200)
 
     async def create_rpc_task(self, request: web.Request) -> web.Response:
         device_id = request.match_info["device_id"]
