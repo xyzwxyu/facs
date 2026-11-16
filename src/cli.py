@@ -19,7 +19,7 @@ import threading
 import uuid
 from concurrent.futures import CancelledError
 from typing import Any
-from urllib.parse import quote, urlsplit
+from urllib.parse import quote, urlencode, urlsplit
 
 import aiohttp
 import cmd2
@@ -140,11 +140,16 @@ class ApiClient:
             )
         return self._session
 
-    async def request(self, method: str, path: str, json_data: Any = None) -> Any:
+    async def request(self, method: str, path: str, json_data: Any = None, *, timeout_seconds: float | None = None) -> Any:
         if self.sock_path is None:
-            return await self._request_remote(method, path, json_data)
+            return await self._request_remote(method, path, json_data, timeout_seconds or 10)
         session = await self._get_session()
-        async with session.request(method, f"{self.base_url}{path}", json=json_data) as response:
+        request_context = (
+            session.request(method, f"{self.base_url}{path}", json=json_data, timeout=aiohttp.ClientTimeout(total=timeout_seconds))
+            if timeout_seconds is not None
+            else session.request(method, f"{self.base_url}{path}", json=json_data)
+        )
+        async with request_context as response:
             text = await response.text()
             if response.status >= 400:
                 raise ApiError(response.status, text.strip())
@@ -155,7 +160,7 @@ class ApiClient:
     async def all_devices(self) -> list[dict[str, Any]]:
         devices: list[dict[str, Any]] = []
         while True:
-            response = await self.request("GET", f"/api/devices?offset={len(devices)}&limit=1000")
+            response = await self.request("GET", f"/api/devices?offset={len(devices)}&limit=1000", timeout_seconds=60)
             page = response.get("devices", [])
             devices.extend(page)
             if len(page) < 1000:
@@ -207,26 +212,26 @@ class ApiClient:
                     future.set_exception(ConnectionError("remote WebSocket disconnected"))
             self._pending_replies.clear()
 
-    async def _request_remote(self, method: str, path: str, data: Any) -> Any:
+    async def _request_remote(self, method: str, path: str, data: Any, timeout_seconds: float = 10) -> Any:
         ws = await self._get_ws()
         request_id = uuid.uuid4().hex
         reply = asyncio.get_running_loop().create_future()
         self._pending_replies[request_id] = reply
         try:
             await ws.send_json({"id": request_id, "method": method, "path": path, "data": data})
-            result = await asyncio.wait_for(reply, timeout=10)
+            result = await asyncio.wait_for(reply, timeout=timeout_seconds)
             if result["status"] >= 400:
                 raise ApiError(result["status"], str(result.get("data", "")))
             return result.get("data")
         finally:
             self._pending_replies.pop(request_id, None)
 
-    def _run(self, method: str, path: str, json_data: Any = None) -> Any:
+    def _run(self, method: str, path: str, json_data: Any = None, *, timeout_seconds: float = 15) -> Any:
         if self.async_runner is None:
             raise RuntimeError("CLI event loop is not configured")
-        future = self.async_runner.run(self.request(method, path, json_data))
+        future = self.async_runner.run(self.request(method, path, json_data, timeout_seconds=timeout_seconds))
         try:
-            return future.result(timeout=15)
+            return future.result(timeout=timeout_seconds + 5)
         except TimeoutError:
             future.cancel()
             raise
@@ -237,8 +242,11 @@ class ApiClient:
     def post(self, path: str, json_data: Any = None) -> Any:
         return self._run("POST", path, json_data)
 
-    def delete(self, path: str) -> Any:
-        return self._run("DELETE", path)
+    def put(self, path: str, json_data: Any = None) -> Any:
+        return self._run("PUT", path, json_data)
+
+    def delete(self, path: str, *, timeout_seconds: float = 15) -> Any:
+        return self._run("DELETE", path, timeout_seconds=timeout_seconds)
 
     async def events(self):
         if self.sock_path is None:
@@ -522,30 +530,104 @@ class FacsShell(cmd2.Cmd):
             )
         self.poutput(table if devices else f"No {args.scope} devices.")
 
-    unprovision_parser = cmd2.Cmd2ArgumentParser()
-    unprovision_parser.add_argument("target", help="device ID or 'all'")
-    unprovision_parser.add_argument("--yes", action="store_true", help="confirm deleting all devices")
+    provision_parser = cmd2.Cmd2ArgumentParser()
+    provision_actions = provision_parser.add_subparsers(dest="provision_action", required=True)
 
-    @with_argparser(unprovision_parser)
+    show_actions = provision_actions.add_parser("show").add_subparsers(dest="show_action", required=True)
+    show_settings_parser = show_actions.add_parser("settings")
+    show_settings_parser.add_argument("--cpe", dest="cpe_id", help="show settings scoped to this CPE")
+
+    get_actions = provision_actions.add_parser("get").add_subparsers(dest="get_action", required=True)
+    get_settings_parser = get_actions.add_parser("settings")
+    get_settings_parser.add_argument("parameter_path", help="full CWMP parameter path")
+    get_settings_parser.add_argument("--cpe", dest="cpe_id", help="read settings scoped to this CPE")
+
+    set_actions = provision_actions.add_parser("set").add_subparsers(dest="set_action", required=True)
+    set_settings_parser = set_actions.add_parser("settings")
+    set_settings_parser.add_argument("parameter_path", help="full CWMP parameter path")
+    set_settings_parser.add_argument("value", help="string value to provision")
+    set_settings_parser.add_argument("value_type", nargs="?", default="xsd:string", help="XSD value type (default: xsd:string)")
+    set_settings_parser.add_argument("--cpe", dest="cpe_id", help="stage this setting for a CPE")
+
+    remove_parser = provision_actions.add_parser("remove")
+    remove_parser.add_argument("target", help="device ID or 'all'")
+    remove_parser.add_argument("--yes", action="store_true", help="confirm deleting all devices")
+
+    @with_argparser(provision_parser)
     @with_category("Main commands")
-    def do_unprovision(self, args) -> None:
-        """Delete one CPE, or all CPEs with `unprovision all`."""
+    def do_provision(self, args) -> None:
+        """Manage provisioning settings and remove CPEs."""
+        if args.provision_action == "show":
+            self._show_provisioning_settings(args.cpe_id)
+            return
+        if args.provision_action == "get":
+            self._get_provisioning_setting(args.parameter_path, args.cpe_id)
+            return
+        if args.provision_action == "set":
+            self._set_provisioning_setting(args.parameter_path, args.value, args.value_type, args.cpe_id)
+            return
+        self._remove_provisioning_target(args.target, args.yes)
+
+    @staticmethod
+    def _provisioning_scope_query(cpe_id: str | None) -> str:
+        return f"?{urlencode({'cpe_id': cpe_id})}" if cpe_id else ""
+
+    def _show_provisioning_settings(self, cpe_id: str | None) -> None:
+        title = f"Provisioning settings ({cpe_id})" if cpe_id else "Global provisioning settings"
         try:
-            if args.target == "all":
-                if not args.yes:
-                    self.poutput(ansi.style("Deleting all devices requires: unprovision all --yes", fg=Fg.LIGHT_YELLOW))
+            response = self.api_client.get(f"/api/provisioning/settings{self._provisioning_scope_query(cpe_id)}")
+        except Exception as exc:
+            self.poutput(ansi.style(f"Failed to query provisioning settings: {exc}", fg=Fg.RED))
+            return
+        settings = response.get("settings", [])
+        table = Table(title=title)
+        table.add_column("Parameter")
+        table.add_column("Value")
+        table.add_column("XSD type")
+        for setting in settings:
+            table.add_row(str(setting.get("parameter_path", "")), str(setting.get("value", "")), str(setting.get("value_type", "")))
+        self.poutput(table if settings else "No provisioning settings in this scope.")
+
+    def _get_provisioning_setting(self, parameter_path: str, cpe_id: str | None) -> None:
+        path = f"/api/provisioning/settings/{quote(parameter_path, safe='')}"
+        try:
+            response = self.api_client.get(f"{path}{self._provisioning_scope_query(cpe_id)}")
+        except Exception as exc:
+            self.poutput(ansi.style(f"Failed to get provisioning setting: {exc}", fg=Fg.RED))
+            return
+        setting = response.get("setting", {})
+        self.poutput(f"{setting.get('parameter_path', parameter_path)} = {setting.get('value', '')} ({setting.get('value_type', 'xsd:string')})")
+
+    def _set_provisioning_setting(self, parameter_path: str, value: str, value_type: str, cpe_id: str | None) -> None:
+        path = f"/api/provisioning/settings/{quote(parameter_path, safe='')}"
+        payload = {"value": value, "value_type": value_type}
+        try:
+            self.api_client.put(f"{path}{self._provisioning_scope_query(cpe_id)}", payload)
+        except Exception as exc:
+            self.poutput(ansi.style(f"Failed to set provisioning setting: {exc}", fg=Fg.RED))
+            return
+        scope = f" for CPE {cpe_id}" if cpe_id else " globally"
+        self.poutput(ansi.style(f"Saved {parameter_path}{scope}.", fg=Fg.GREEN))
+
+    def _remove_provisioning_target(self, target: str, yes: bool) -> None:
+        try:
+            if target == "all":
+                if not yes:
+                    self.poutput(ansi.style("Deleting all devices requires: provision remove all --yes", fg=Fg.LIGHT_YELLOW))
                     return
-                response = self.api_client.delete("/api/devices")
+                response = self.api_client.delete("/api/devices", timeout_seconds=120)
                 self._clear_device()
                 self.poutput(f"Deleted {response.get('deleted_count', 0)} devices.")
             else:
-                self.api_client.delete(f"/api/devices/{quote(args.target, safe='')}")
-                if self.selected_device_id == args.target:
+                self.api_client.delete(f"/api/devices/{quote(target, safe='')}")
+                if self.selected_device_id == target:
                     self._clear_device()
-                self.poutput(f"Deleted device {args.target}.")
+                self.poutput(f"Deleted device {target}.")
             self.refresh_device_choices()
         except Exception as exc:
-            self.poutput(ansi.style(f"Failed to unprovision: {exc}", fg=Fg.RED))
+            logger.exception("failed to remove CPE target %s", target)
+            detail = str(exc) or type(exc).__name__
+            self.poutput(ansi.style(f"Failed to remove CPE: {detail}", fg=Fg.RED))
 
     @with_category("Main commands")
     def do_exit(self, statement: cmd2.Statement) -> bool | None:

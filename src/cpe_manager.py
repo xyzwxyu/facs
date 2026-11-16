@@ -89,6 +89,31 @@ class CPEManager:
     async def update_parameters(self, device_id: str, parameters: Sequence[Mapping[str, str]]) -> None:
         await self.db.upsert_device_parameters(device_id, list(parameters))
 
+    async def get_provisioning_settings(self, cpe_id: str | None = None) -> list[dict[str, Any]]:
+        rows = await self.db.get_provisioning_settings(cpe_id)
+        return [dict(row) for row in rows]
+
+    async def get_provisioning_setting(self, parameter_path: str, cpe_id: str | None = None) -> dict[str, Any] | None:
+        row = await self.db.get_provisioning_setting(parameter_path, cpe_id)
+        return dict(row) if row else None
+
+    async def set_provisioning_setting(
+        self,
+        parameter_path: str,
+        value: str,
+        value_type: str,
+        cpe_id: str | None = None,
+    ) -> dict[str, Any]:
+        row = await self.db.set_provisioning_setting(parameter_path, value, value_type, cpe_id)
+        return dict(row)
+
+    async def get_effective_provisioning_settings(self, cpe_id: str) -> list[dict[str, Any]]:
+        global_settings = await self.get_provisioning_settings()
+        cpe_settings = await self.get_provisioning_settings(cpe_id)
+        effective = {setting["parameter_path"]: setting for setting in global_settings}
+        effective.update({setting["parameter_path"]: setting for setting in cpe_settings})
+        return [effective[path] for path in sorted(effective)]
+
     async def remove_cpe(self, cpe_or_device_id) -> bool:
         identifier = cpe_or_device_id if isinstance(cpe_or_device_id, str) else getattr(cpe_or_device_id, "device_id", None)
         return bool(identifier and await self.db.delete_device(identifier))

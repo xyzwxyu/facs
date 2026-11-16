@@ -42,6 +42,15 @@ SUPPORTED_TASK_METHODS = frozenset(
 )
 
 TASK_RESPONSE_METHODS = {method: f"{method}Response" for method in SUPPORTED_TASK_METHODS}
+PROVISIONING_DISCOVERY_KEY = "provisioning-discovery"
+HEARTBEAT_PARAMETER_PATHS = frozenset(
+    {
+        "Device.ManagementServer.HeartbeatPolicy.Enable",
+        "Device.ManagementServer.HeartbeatPolicy.ReportingInterval",
+    }
+)
+PERIODIC_INFORM_ENABLE_PATH = "Device.ManagementServer.PeriodicInformEnable"
+PERIODIC_INFORM_INTERVAL_PATH = "Device.ManagementServer.PeriodicInformInterval"
 
 
 def _parameter_value(parameters: list[dict[str, str]], *suffixes: str) -> str | None:
@@ -141,6 +150,7 @@ class CWMP:
                     device_id=saved.device_id,
                     command_type="GetParameterValues",
                     command=["Device."],
+                    command_key=PROVISIONING_DISCOVERY_KEY,
                 )
             )
             await self.event_bus.publish("cpe.provisioned", {"device_id": saved.device_id})
@@ -218,11 +228,20 @@ class CWMP:
         if method != "Fault" and method != expected_method:
             return self._fault(soap, 8003, response_id or task_id)
 
+        task = await self.task_manager.get_task(task_id) if hasattr(self.task_manager, "get_task") else None
+        is_provisioning_discovery = bool(task and task.command_key == PROVISIONING_DISCOVERY_KEY)
         failed = method == "Fault"
         await self.task_manager.complete_task(task_id, "failed" if failed else "completed")
 
         if not failed and method == "GetParameterValuesResponse" and session.device_id:
-            await self.cpe_manager.update_parameters(session.device_id, soap.parse_parameters())
+            parameters = soap.parse_parameters()
+            await self.cpe_manager.update_parameters(session.device_id, parameters)
+            if is_provisioning_discovery:
+                supported_paths = {parameter.get("Name") for parameter in parameters}
+                heartbeat_supported = HEARTBEAT_PARAMETER_PATHS.issubset(supported_paths)
+                await self._queue_provisioning_settings(session.device_id, heartbeat_supported)
+        elif failed and is_provisioning_discovery and session.device_id:
+            await self._queue_provisioning_settings(session.device_id, heartbeat_supported=False)
 
         await self.event_bus.publish(
             "task.failed" if failed else "task.completed",
@@ -236,6 +255,42 @@ class CWMP:
         session.pending_task_id = None
         session.pending_method = None
         return await self._dispatch_next_task(session, soap)
+
+    async def _queue_provisioning_settings(self, device_id: str, heartbeat_supported: bool) -> None:
+        settings = await self.cpe_manager.get_effective_provisioning_settings(device_id)
+        if not settings:
+            return
+        by_path = {setting["parameter_path"]: dict(setting) for setting in settings}
+        if not heartbeat_supported:
+            for path in HEARTBEAT_PARAMETER_PATHS:
+                by_path.pop(path, None)
+            by_path[PERIODIC_INFORM_ENABLE_PATH] = {
+                "parameter_path": PERIODIC_INFORM_ENABLE_PATH,
+                "value": "true",
+                "value_type": "xsd:boolean",
+            }
+            by_path[PERIODIC_INFORM_INTERVAL_PATH] = {
+                "parameter_path": PERIODIC_INFORM_INTERVAL_PATH,
+                "value": "30",
+                "value_type": "xsd:unsignedInt",
+            }
+        assignments = [
+            {
+                "name": setting["parameter_path"],
+                "value": setting["value"],
+                "type": setting["value_type"],
+            }
+            for setting in (by_path[path] for path in sorted(by_path))
+        ]
+        if not assignments:
+            return
+        await self.task_manager.add_task(
+            Task(
+                device_id=device_id,
+                command_type="SetParameterValues",
+                command=assignments,
+            )
+        )
 
     @staticmethod
     def _fault(soap: SoapBuilder, code: int, message_id: str | int = 1) -> str:
